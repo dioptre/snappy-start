@@ -76,7 +76,7 @@ class FileInfo {
   // Handle write(). Only the data actually written (as indicated by write()'s
   // return value) is reported.
   virtual bool CanWrite() {return false;}
-  virtual void DidWrite(const std::string& data) {abort();}
+  virtual void DidWrite(std::string data) {abort();}
 
   // Handle read(). The data produced is not reported here; it has already been
   // consumed into the process's memory state.
@@ -133,7 +133,7 @@ void WriteEscaped(std::ostream& out, const std::string& data) {
   }
 }
 
-// Standard input. Assumed to be empty.
+// Standard input.
 class StdinInfo final : public FileInfo {
 public:
   StdinInfo(): FileInfo(false) {}
@@ -143,44 +143,90 @@ public:
     out << "  replay_close(0);\n";
   }
 
-  bool CanRead() override {return true;}
-  void DidRead(size_t amount) override { assert(amount = 0); }
+  // If the app tries to read from stdin, we will end the recording.
 
 private:
   std::string written;  // concatenation of all write()s
 };
 
-// Standard output and error (assumed to be the same pipe). We record the raw
-// writes to replay later.
+// Standard output and error. We record the raw writes to replay later. We
+// don't know if stdout and stderr go to the same place. If they do, then it
+// is important that we retain the correct ordering of the writes between the
+// two, but we can't just merge them now because they might not go to the
+// same place.
 class StdoutInfo final : public FileInfo {
 public:
   StdoutInfo(): FileInfo(false) {}
 
-  void WriteReplay(int fd, std::ostream& out) override {
-    out << "  replay_write(1, \"";
-    WriteEscaped(out, written);
-    out << "\", " << written.size() << ");\n";
+  void AddBuffer(std::string data, bool is_stderr) {
+    if (!buffers.empty() && buffers.back().is_stderr == is_stderr) {
+      buffers.back().data.append(data);
+    } else {
+      buffers.push_back(Buffer { std::move(data), is_stderr });
+    }
+  }
 
-    // TODO: Deal with stdout being dup()ed and the original closed.
-    assert(fd == 1);
+  void WriteReplay(int fd, std::ostream& out) override {
+    if (wrote_replay) return;
+    wrote_replay = true;
+
+    for (auto& buffer: buffers) {
+      out << "  replay_write(" << (buffer.is_stderr ? 2 : 1)
+          << ", \"";
+      WriteEscaped(out, buffer.data);
+      out << "\", " << buffer.data.size() << ");\n";
+    }
   }
 
   void WriteReplayClosed(std::ostream& out) override {
     WriteReplay(1, out);
-    out << "  replay_close(1);\n"
-           "  replay_close(2);\n";
+    out << "  replay_close(1);\n";
   }
 
   bool CanWrite() override {
     return true;
   }
 
-  void DidWrite(const std::string& data) override {
-    written.append(data);
+  void DidWrite(std::string data) override {
+    AddBuffer(std::move(data), false);
   }
 
 private:
-  std::string written;  // concatenation of all write()s
+  struct Buffer {
+    std::string data;
+    bool is_stderr;
+  };
+
+  std::vector<Buffer> buffers;
+  bool wrote_replay = false;
+};
+
+// Standard error, which layers on top of StdoutInfo so that we can track
+// the interleaving of the two.
+class StderrInfo final : public FileInfo {
+public:
+  explicit StderrInfo(std::shared_ptr<StdoutInfo> stdout)
+      : FileInfo(false), stdout(std::move(stdout)) {}
+
+  void WriteReplay(int fd, std::ostream& out) override {
+    stdout->WriteReplay(1, out);
+  }
+
+  void WriteReplayClosed(std::ostream& out) override {
+    stdout->WriteReplay(1, out);
+    out << "  replay_close(2);\n";
+  }
+
+  bool CanWrite() override {
+    return true;
+  }
+
+  void DidWrite(std::string data) override {
+    stdout->AddBuffer(std::move(data), true);
+  }
+
+private:
+  std::shared_ptr<StdoutInfo> stdout;
 };
 
 // A "static file" is a file on disk which is expected to have exactly the
@@ -738,7 +784,8 @@ int main(int argc, char **argv) {
   // For now we're assuming stdout and stderr are merged.
   auto stdout = std::make_shared<StdoutInfo>();
   ptracer.SetFd(STDOUT_FILENO, {stdout, false});
-  ptracer.SetFd(STDERR_FILENO, {std::move(stdout), false});
+  ptracer.SetFd(STDERR_FILENO, {
+      std::make_shared<StderrInfo>(std::move(stdout)), false});
 
   for (;;) {
     int status;
