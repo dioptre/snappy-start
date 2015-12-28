@@ -13,17 +13,271 @@
 #include <sys/syscall.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <sys/epoll.h>
 #include <unistd.h>
 
+#include <iostream>
 #include <list>
 #include <map>
+#include <memory>
+#include <set>
 #include <sstream>
-
+#include <vector>
 
 // This is an example of using ptrace() to log syscalls called by a
 // child process.
 
 namespace {
+
+class EpollInfo;
+
+// State of an open file description.
+class FileInfo {
+ public:
+  inline explicit FileInfo(bool nonblock): nonblock(nonblock) {}
+  virtual ~FileInfo();
+
+  // Whether the file is in non-blocking mode.
+  bool nonblock;
+
+  // Epoll FD which is reporting events for this file.
+  EpollInfo* epoll_watcher = nullptr;
+  int epoll_watch_fd;  // FD number under which this file was watched.
+
+  // Write code that replays creation of this FD.
+  virtual void WriteReplay(int fd, std::ostream& out) = 0;
+
+  // Write code that replays the side effects of the operations performed
+  // on this FD, but does not create the FD. Used when the FD was closed
+  // before the end of recording. Default implementation writes nothing on
+  // the assumption that there are no side-effects if the FD has gone away.
+  //
+  // Replays of closed files will take place before replays of open files.
+  virtual void WriteReplayClosed(std::ostream& out) {}
+
+  // TODO: Closed files may still require replay!
+
+  // For each system call `foo` targeting a file descriptor, the method
+  // `CanFoo()` is called on entry. If it returns false, then the recording
+  // ends and the snapshot is dumped here. If `CanFoo()` returns true, then
+  // we proceed with the syscall. When it completes, if it completed
+  // successfully, we call `DidFoo()` to report the results. If the syscall
+  // returned an error, no method is called, since an error generally means
+  // that nothing happened.
+  //
+  // All methods have default implementations that indicate the syscall cannot
+  // be recorded.
+
+  // Handle mmap(). DidMmap() returns the path of the mapped file.
+  virtual bool CanMmap() {return false;}
+  virtual std::string DidMmap(off_t offset, size_t size) {abort();}
+
+  // Handle write(). Only the data actually written (as indicated by write()'s
+  // return value) is reported.
+  virtual bool CanWrite() {return false;}
+  virtual void DidWrite(const std::string& data) {abort();}
+
+  // Handle read(). The data produced is not reported here; it has already been
+  // consumed into the process's memory state.
+  virtual bool CanRead() {return false;}
+  virtual void DidRead(size_t amount) {abort();}
+
+  // Handle bind().
+  virtual bool CanBind() {return false;}
+  virtual void DidBind(struct sockaddr* addr, socklen_t attrlen) {abort();}
+
+  // Handle listen().
+  virtual bool CanListen() {return false;}
+  virtual void DidListen(int backlog) {abort();}
+
+  // Handle epoll_ctl().
+  virtual bool CanEpollCtl(FileInfo* target) {return false;}
+  virtual void DidEpollCtl(int op, int fd, FileInfo* target,
+                           struct epoll_event event) {abort();}
+
+  // Handle epoll_wait().
+  virtual bool CanEpollWait(int timeout) {return false;}
+  virtual void DidEpollWait(struct epoll_event events[], int count) {abort();}
+
+  // Handle signalfd() on existing file.
+  virtual bool CanSignalfd() {return false;}
+  virtual void DidSignalfd(const sigset_t* mask, int flags) {abort();}
+};
+
+void WriteEscaped(std::ostream& out, const std::string& data) {
+  for (char c: data) {
+    switch (c) {
+      case '\a': out << "\\a"; break;
+      case '\b': out << "\\b"; break;
+      case '\f': out << "\\f"; break;
+      case '\n': out << "\\n"; break;
+      case '\r': out << "\\r"; break;
+      case '\t': out << "\\t"; break;
+      case '\v': out << "\\v"; break;
+      case '\'': out << "\\\'"; break;
+      case '\"': out << "\\\""; break;
+      case '\\': out << "\\\\"; break;
+      default:
+        if (c < 0x20 || c >= 0x7f) {
+          out << "\\x";
+          char old_fill = out.fill('0');
+          out.width(2);
+          out << static_cast<unsigned int>(static_cast<uint8_t>(c));
+          out.fill(old_fill);
+        } else {
+          out.put(c);
+        }
+        break;
+    }
+  }
+}
+
+// Standard input. Assumed to be empty.
+class StdinInfo final : public FileInfo {
+public:
+  StdinInfo(): FileInfo(false) {}
+
+  void WriteReplay(int fd, std::ostream& out) override {}
+  void WriteReplayClosed(std::ostream& out) override {
+    out << "  replay_close(0);\n";
+  }
+
+  bool CanRead() override {return true;}
+  void DidRead(size_t amount) override { assert(amount = 0); }
+
+private:
+  std::string written;  // concatenation of all write()s
+};
+
+// Standard output and error (assumed to be the same pipe). We record the raw
+// writes to replay later.
+class StdoutInfo final : public FileInfo {
+public:
+  StdoutInfo(): FileInfo(false) {}
+
+  void WriteReplay(int fd, std::ostream& out) override {
+    out << "  replay_write(1, \"";
+    WriteEscaped(out, written);
+    out << "\", " << written.size() << ");\n";
+
+    // TODO: Deal with stdout being dup()ed and the original closed.
+    assert(fd == 1);
+  }
+
+  void WriteReplayClosed(std::ostream& out) override {
+    WriteReplay(1, out);
+    out << "  replay_close(1);\n"
+           "  replay_close(2);\n";
+  }
+
+  bool CanWrite() override {
+    return true;
+  }
+
+  void DidWrite(const std::string& data) override {
+    written.append(data);
+  }
+
+private:
+  std::string written;  // concatenation of all write()s
+};
+
+// A "static file" is a file on disk which is expected to have exactly the
+// same content at record and replay times, e.g. libraries.
+class StaticFileInfo final : public FileInfo {
+public:
+  StaticFileInfo(std::string path, int open_flags)
+      : FileInfo(open_flags & O_NONBLOCK),
+        path(std::move(path)), open_flags(open_flags) {}
+
+  void WriteReplay(int fd, std::ostream& out) override {
+    out << "  replay_open(" << fd << ", \"";
+    WriteEscaped(out, path);
+    out << "\", " << open_flags << ", 0, " << offset << ");\n";
+  }
+
+  bool CanMmap() override {return true;}
+  std::string DidMmap(off_t offset, size_t size) override {
+    return path;
+  }
+
+  bool CanRead() override { return true; }
+  void DidRead(size_t amount) override { offset += amount; }
+
+private:
+  std::string path;
+  int open_flags;
+  off_t offset = 0;
+};
+
+// A "dynamic file" is a file on disk created by the recorded process. The
+// creation will be replayed later.
+class DynamicFileInfo final : public FileInfo {
+public:
+
+private:
+  int open_flags;
+  std::string path;
+  // TODO: Track file writes.
+};
+
+// A network socket. Mainly we support setting up listen sockets.
+class SocketInfo final : public FileInfo {
+public:
+
+private:
+  int socket_domain;
+  int socket_type;
+  int socket_protocol;
+  std::string bind_addr;
+  std::string connect_addr;
+  int listen_backlog;
+};
+
+// An epoll FD.
+class EpollInfo final : public FileInfo {
+public:
+  ~EpollInfo() {
+    for (auto& entry: watching) {
+      assert(entry.second->epoll_watcher == this);
+      entry.second->epoll_watcher = nullptr;
+    }
+  }
+
+  void Unwatch(int fd, FileInfo* file) {
+    auto iter = watching.find(fd);
+    assert(iter != watching.end() && iter->second == file);
+    watching.erase(iter);
+  }
+
+private:
+  std::map<int, FileInfo*> watching;
+};
+
+// An eventfd.
+class EventfdInfo final : public FileInfo {
+public:
+
+private:
+  int event_flags;  // only for EFD_SEMAPHORE
+  unsigned int event_value;
+};
+
+// A signalfd.
+class SignalfdInfo final : public FileInfo {
+public:
+
+private:
+  sigset_t siganl_mask;
+};
+
+FileInfo::~FileInfo() {
+  if (epoll_watcher != nullptr) {
+    epoll_watcher->Unwatch(epoll_watch_fd, this);
+  }
+}
+
+// ===================================================================
 
 // Flag which is set in the signal number for syscall entry/exit when
 // the option PTRACE_O_TRACESYSGOOD is enabled.
@@ -52,12 +306,14 @@ class SyscallParams {
   uintptr_t result;
 };
 
+// State of a memory mapping.
 class MmapInfo {
  public:
   uintptr_t addr;
   size_t size;
   // Current access permissions.
   int prot;
+  int flags;
   // Maximum access permissions that this mapping has ever been
   // mmap()'d or mprotect()'d with.  This is used to determine whether
   // mapping could have been written to.
@@ -66,13 +322,25 @@ class MmapInfo {
   uint64_t file_offset;
 };
 
+// State of an open file descriptor.
+//
+// (In Unix terminology, a file descriptor number is a reference to a file
+// description object in kernel space. Multiple file descriptors can reference
+// the same file description, especially as a result of calling dup(). The
+// close-on-exec flag is a property of the descriptor itself, not the
+// description. All other state is generally on the description.)
+struct FdInfo {
+  std::shared_ptr<FileInfo> file;
+  bool cloexec;
+};
+
 class Ptracer {
   int pid_;
   std::list<MmapInfo> mappings_;
-  std::map<int, std::string> fds_;
+  std::map<int, FdInfo> fds_;
+  std::vector<std::shared_ptr<FileInfo>> files_;
   uint64_t fs_segment_base_;
   uintptr_t tid_address_;
-  FILE *info_fp_;
 
   uintptr_t ReadWord(uintptr_t addr) {
     errno = 0;
@@ -90,14 +358,25 @@ class Ptracer {
   std::string ReadString(uintptr_t addr) {
     // TODO: Reading one byte at a time is inefficient (though reading
     // one word at a time is not great either).
-    std::stringbuf buf;
+    std::string buf;
     for (;;) {
       char ch = ReadByte(addr++);
       if (!ch)
         break;
-      buf.sputc(ch);
+      buf.push_back(ch);
     }
-    return buf.str();
+    return buf;
+  }
+
+  std::string ReadBytes(uintptr_t addr, size_t size) {
+    // TODO: Reading one byte at a time is inefficient (though reading
+    // one word at a time is not great either).
+    std::string buf;
+    for (size_t i = 0; i < size; i++) {
+      char ch = ReadByte(addr + i);
+      buf.push_back(ch);
+    }
+    return buf;
   }
 
   void ChangeMapping(uintptr_t change_start, size_t change_size,
@@ -160,6 +439,11 @@ class Ptracer {
  public:
   Ptracer(int pid): pid_(pid), fs_segment_base_(0), tid_address_(0) {}
 
+  void SetFd(int fd, FdInfo info) {
+    fds_[fd] = info;
+    files_.push_back(info.file);
+  }
+
   // Returns whether we should allow the syscall to proceed.
   // Returning false indicates that we should snapshot the process.
   bool CanHandleSyscall(struct user_regs_struct *regs) {
@@ -172,7 +456,15 @@ class Ptracer {
       case __NR_mmap: {
         // TODO: Be stricter about which flags we allow.
         uintptr_t flags = params.args[3];
-        return (flags & MAP_SHARED) == 0;
+        if ((flags & MAP_SHARED) != 0) return false;
+
+        int fd_arg = params.args[4];
+        if (fd_arg == -1) {
+          return true;
+        } else {
+          auto iter = fds_.find(fd_arg);
+          return iter != fds_.end() && iter->second.file->CanMmap();
+        }
       }
 
       case __NR_open: {
@@ -182,30 +474,41 @@ class Ptracer {
                (flags & ~allowed_flags) == 0;
       }
 
+      case __NR_write: {
+        int fd_arg = params.args[0];
+        auto iter = fds_.find(fd_arg);
+        return iter != fds_.end() && iter->second.file->CanWrite();
+      }
+
       // These are handled below.
       case __NR_close:
       case __NR_mprotect:
       case __NR_munmap:
       case __NR_set_tid_address:
+        return true;
 
-      case __NR_access:
+      // These are safe to ignore.
+      case __NR_access:     // TODO: Only allow on static file paths.
+      case __NR_fadvise64:
       case __NR_fstat:
-      case __NR_futex:
+      case __NR_futex:      // TODO: Don't allow blocking.
       case __NR_getcwd:
-      case __NR_getdents:
+      case __NR_getdents:   // TODO: Treat like read().
       case __NR_getegid:
       case __NR_geteuid:
       case __NR_getgid:
       case __NR_getrlimit:
       case __NR_getuid:
-      case __NR_ioctl:
-      case __NR_lseek:
-      case __NR_lstat:
-      case __NR_pread64:
-      case __NR_read:
-      case __NR_readlink:
-      case __NR_stat:
+      case __NR_ioctl:      // TODO: Filter on specific ioctls.
+      case __NR_lseek:      // TODO: Must handle.
+      case __NR_lstat:      // TODO: Only allow on static file paths.
+      case __NR_pread64:    // Only valid on disk files and doesn't
+                            // affect seek pos, so we can ignore!
+      case __NR_read:       // TODO: Must handle.
+      case __NR_readlink:   // TODO: Only allow on static file paths.
+      case __NR_stat:       // TODO: Only allow on static file paths.
       case __NR_uname:
+        return true;
 
       // TODO: The following will require further handling.
       case __NR_openat:
@@ -221,8 +524,10 @@ class Ptracer {
   void HandleSyscall(struct user_regs_struct *regs) {
     SyscallParams params(regs);
 
-    if (params.result > -(uintptr_t) 0x1000) {
+    if (params.result > -(uintptr_t) 0x1000 &&
+        params.sysnum != __NR_close) {
       // Syscall returned an error so should have had no effect.
+      // (Except for close() which does in fact close the FD even on error.)
       return;
     }
 
@@ -230,8 +535,14 @@ class Ptracer {
       case __NR_open: {
         std::string filename(ReadString(params.args[0]));
         int fd_result = params.result;
-        if (fd_result >= 0)
-          fds_[fd_result] = filename;
+        // TODO: inspect flags
+        int flags = params.args[1];
+        if (fd_result >= 0) {
+          fds_[fd_result] = FdInfo {
+            std::make_shared<StaticFileInfo>(std::move(filename), flags),
+            static_cast<bool>(flags & O_CLOEXEC)
+          };
+        }
         break;
       }
       case __NR_close: {
@@ -250,13 +561,16 @@ class Ptracer {
         map.addr = addr;
         map.size = size;
         map.prot = params.args[2];
+        map.flags = params.args[3];
         map.max_prot = map.prot;
+        map.file_offset = params.args[5];
         int fd_arg = params.args[4];
         if (fd_arg != -1) {
-          assert(fds_.find(fd_arg) != fds_.end());
-          map.filename = fds_[fd_arg];
+          auto iter = fds_.find(fd_arg);
+          assert(iter != fds_.end());
+          map.filename = iter->second.file->DidMmap(
+              map.file_offset, map.size);
         }
-        map.file_offset = params.args[5];
         mappings_.push_back(map);
         break;
       }
@@ -278,61 +592,54 @@ class Ptracer {
         tid_address_ = params.args[0];
         break;
       }
+      case __NR_write: {
+        auto iter = fds_.find(params.args[0]);
+        assert(iter != fds_.end());
+        iter->second.file->DidWrite(ReadBytes(params.args[1], params.result));
+        break;
+      }
     }
   }
 
-  void Put(uint64_t val) {
-    fwrite(&val, sizeof(val), 1, info_fp_);
-  }
+  void Dump(std::ostream& out, const struct user_regs_struct *regs,
+                               const struct user_fpregs_struct *fpregs) {
+    // Determine the final FD numbers mapping to each file.
+    std::map<FileInfo*, int> final_fds;
+    for (auto& fd: fds_) {
+      // This will only insert the first fd we see mapping to this file.
+      final_fds.insert(std::make_pair(fd.second.file.get(), fd.first));
+    }
 
-  void PutString(const std::string &str) {
-    Put(str.size());
-    fwrite(str.c_str(), str.size() + 1, 1, info_fp_);
-  }
+    // Replay all closed files.
+    for (auto& file: files_) {
+      if (final_fds.count(file.get()) == 0) {
+        file->WriteReplayClosed(out);
+        final_fds.insert(std::make_pair(file.get(), -1));
+      }
+    }
 
-  void Dump(const struct user_regs_struct *regs) {
-    // We don't support restoring FDs yet, so no FDs must be left open.
-    assert(fds_.size() == 0);
+    // Replay open files.
+    for (auto& fd: fds_) {
+      int final_fd = final_fds[fd.second.file.get()];
+      if (fd.first == final_fd) {
+        fd.second.file->WriteReplay(fd.first, out);
+      } else {
+        // This is a duplicate.
+        out << "  replay_dup(" << fd.first << ", " << final_fd << ");\n";
+      }
+    }
 
     FILE *mapfile = fopen("out_pages", "w");
     assert(mapfile);
     uintptr_t mapfile_offset = 0;
 
-    info_fp_ = fopen("out_info", "w");
-    assert(info_fp_);
-
-    Put(regs->rax);
-    Put(regs->rcx);
-    Put(regs->rdx);
-    Put(regs->rbx);
-    Put(regs->rsp);
-    Put(regs->rbp);
-    Put(regs->rsi);
-    Put(regs->rdi);
-    Put(regs->r8);
-    Put(regs->r9);
-    Put(regs->r10);
-    Put(regs->r11);
-    Put(regs->r12);
-    Put(regs->r13);
-    Put(regs->r14);
-    Put(regs->r15);
-    Put(regs->rip);
-    Put(regs->eflags);
-    Put(fs_segment_base_);
-    Put(tid_address_);
-
-    Put(mappings_.size());
     for (auto &map : mappings_) {
-      Put(map.addr);
-      Put(map.size);
-      Put(map.prot);
-      PutString(map.filename);
-      Put(map.file_offset);
+      if (map.filename.empty() || (map.max_prot & PROT_WRITE)) {
+        // Data in memory does not necessarily match anything on disk.
+        // Must copy into mapfile.
+        out << "  replay_memory(" << map.addr << ", " << map.size << ", "
+            << map.prot << ", " << map.file_offset << ");\n";
 
-      if (map.max_prot & PROT_WRITE) {
-        Put(1);
-        Put(mapfile_offset);
         for (uintptr_t offset = 0; offset < map.size;
              offset += sizeof(uintptr_t)) {
           uintptr_t word = ReadWord(map.addr + offset);
@@ -340,11 +647,30 @@ class Ptracer {
         }
         mapfile_offset += map.size;
       } else {
-        Put(0);
+        // Map directly from original file.
+        out << "  replay_mmap(" << map.addr << ", " << map.size << ", "
+            << map.prot << ", " << map.flags << ", \"";
+        WriteEscaped(out, map.filename);
+        out << "\", " << map.file_offset << ");\n";
       }
     }
+
+    assert(regs->fs_base == fs_segment_base_);
+
+    out << "  struct replay_thread_state state;\n"
+           "  state.tid = " << pid_ << ";\n"
+           "  memcpy(&state.regs, \"";
+    WriteEscaped(out, std::string(reinterpret_cast<const char*>(regs), sizeof(*regs)));
+    out <<                           "\";\n"
+           "  memcpy(&state.fpregs, \"";
+    WriteEscaped(out, std::string(reinterpret_cast<const char*>(fpregs), sizeof(*fpregs)));
+    out <<                             "\";\n"
+           "  state.tid_address = " << reinterpret_cast<uintptr_t>(tid_address_) << ";\n"
+           // TODO: stack_start
+           // TODO: sigmask
+           "  replay_finish(&state);\n";
+
     fclose(mapfile);
-    fclose(info_fp_);
   }
 
   void TerminateSubprocess() {
@@ -401,6 +727,18 @@ int main(int argc, char **argv) {
   bool syscall_entry = true;
 
   Ptracer ptracer(pid);
+
+  // Initialize inherited FDs.
+  //
+  // TODO: The right thing to do here depends on the context. Provide an API!
+
+  ptracer.SetFd(STDIN_FILENO, {std::make_shared<StdinInfo>(), false});
+
+  // For now we're assuming stdout and stderr are merged.
+  auto stdout = std::make_shared<StdoutInfo>();
+  ptracer.SetFd(STDOUT_FILENO, {stdout, false});
+  ptracer.SetFd(STDERR_FILENO, {std::move(stdout), false});
+
   for (;;) {
     int status;
     int rc = waitpid(pid, &status, 0);
@@ -422,11 +760,17 @@ int main(int argc, char **argv) {
         } else if (!ptracer.CanHandleSyscall(&regs)) {
           // Unrecognised syscall: trigger snapshotting.
 
+          std::cerr << "ending record due to syscall: " << regs.orig_rax << std::endl;
+
           // Rewind instruction pointer to before the syscall instruction.
           regs.rip -= 2;
           regs.rax = regs.orig_rax;
 
-          ptracer.Dump(&regs);
+          struct user_fpregs_struct fpregs;
+          rc = ptrace(PTRACE_GETFPREGS, pid, 0, &fpregs);
+          assert(rc == 0);
+
+          ptracer.Dump(std::cout, &regs, &fpregs);
           ptracer.TerminateSubprocess();
           break;
         }
