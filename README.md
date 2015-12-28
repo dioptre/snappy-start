@@ -27,21 +27,17 @@ To create a snapshot:
 To run the snapshot:
 
 ```
-./out/restore
+(TODO: currently in flux)
 ```
 
 The program will be snapshotted when it first calls an unhandled
 syscall, such as `getpid()`.
 
-Currently, the snapshot data is written to hard-coded files `out_info`
-(containing register state and a list of memory mappings) and `out_pages`
-(data to restore using `mmap()`).
-
 Example:
 
 ```
 $ ./out/ptracer ./out/elf_loader /usr/bin/python tests/python_example.py
-$ ./out/restore
+$ (TODO: currently in flux)
 Hello world, from restored Python process
 ```
 
@@ -51,3 +47,7 @@ Hello world, from restored Python process
 The idea for this tool comes from Kenton Varda, who proposed using a
 "record/replay" approach, using `ptrace()` to monitor syscalls so that
 they can later be replayed.
+
+Mark Seaborn put together an initial working end-to-end implementation.
+
+Kenton is now extending it to support more system calls.
