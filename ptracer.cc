@@ -120,11 +120,13 @@ void WriteEscaped(std::ostream& out, const std::string& data) {
       case '\\': out << "\\\\"; break;
       default:
         if (c < 0x20 || c >= 0x7f) {
-          out << "\\x";
+          out << "\\";
           char old_fill = out.fill('0');
-          out.width(2);
+          auto old_flags = out.setf(std::ios_base::oct, std::ios_base::basefield);
+          out.width(3);
           out << static_cast<unsigned int>(static_cast<uint8_t>(c));
           out.fill(old_fill);
+          out.setf(old_flags);
         } else {
           out.put(c);
         }
@@ -648,8 +650,29 @@ class Ptracer {
     }
   }
 
-  void Dump(std::ostream& out, const struct user_regs_struct *regs,
-                               const struct user_fpregs_struct *fpregs) {
+  void Dump(std::ostream& out, const struct user_regs_struct* regs,
+                               const struct user_fpregs_struct* fpregs,
+                               const sigset_t* sigmask) {
+    uintptr_t mapfile_size = 0;
+    for (auto &map : mappings_) {
+      if (map.filename.empty() || (map.max_prot & PROT_WRITE)) {
+        mapfile_size += map.size;
+      }
+    }
+
+    int maxFd = 2;
+    if (!fds_.empty()) {
+      auto iter = fds_.end();
+      --iter;
+      if (iter->first < maxFd) {
+        maxFd = iter->first;
+      }
+    }
+
+    out << "#include \"replay.h\"\n"
+           "void replay() {\n"
+           "  replay_init(" << pid_ << ", " << maxFd << ", " << mapfile_size << ");\n";
+
     // Determine the final FD numbers mapping to each file.
     std::map<FileInfo*, int> final_fds;
     for (auto& fd: fds_) {
@@ -685,7 +708,7 @@ class Ptracer {
         // Data in memory does not necessarily match anything on disk.
         // Must copy into mapfile.
         out << "  replay_memory(" << map.addr << ", " << map.size << ", "
-            << map.prot << ", " << map.file_offset << ");\n";
+            << map.prot << ", " << mapfile_offset << ");\n";
 
         for (uintptr_t offset = 0; offset < map.size;
              offset += sizeof(uintptr_t)) {
@@ -702,22 +725,27 @@ class Ptracer {
       }
     }
 
+    assert(mapfile_offset == mapfile_size);
+
     assert(regs->fs_base == fs_segment_base_);
 
     out << "  struct replay_thread_state state;\n"
            "  state.tid = " << pid_ << ";\n"
            "  memcpy(&state.regs, \"";
     WriteEscaped(out, std::string(reinterpret_cast<const char*>(regs), sizeof(*regs)));
-    out <<                           "\";\n"
+    out <<                           "\", " << sizeof(*regs) << ");\n"
            "  memcpy(&state.fpregs, \"";
     WriteEscaped(out, std::string(reinterpret_cast<const char*>(fpregs), sizeof(*fpregs)));
-    out <<                             "\";\n"
+    out <<                             "\", " << sizeof(*fpregs) << ");\n"
            "  state.tid_address = " << reinterpret_cast<uintptr_t>(tid_address_) << ";\n"
-           // TODO: stack_start
-           // TODO: sigmask
+           "  memcpy(&state.sigmask, \"";
+    WriteEscaped(out, std::string(reinterpret_cast<const char*>(sigmask), sizeof(*sigmask)));
+    out <<                              "\", " << sizeof(*sigmask) << ");\n"
            "  replay_finish(&state);\n";
 
     fclose(mapfile);
+
+    out << "}\n";
   }
 
   void TerminateSubprocess() {
@@ -818,7 +846,16 @@ int main(int argc, char **argv) {
           rc = ptrace(PTRACE_GETFPREGS, pid, 0, &fpregs);
           assert(rc == 0);
 
-          ptracer.Dump(std::cout, &regs, &fpregs);
+          sigset_t sigmask;
+          sigemptyset(&sigmask);
+          // PTRACE_GETSIGMASK is new in 3.11, may not be in userspace headers yet.
+          // The documentation claim that the third argument should be sizeof(sigset_t), but
+          // it appears that the kernel's idea of sigset_t is 8 bytes whereas userspace defines
+          // it to be much larger.
+          rc = ptrace((enum __ptrace_request)0x420a, pid, 8, &sigmask);
+          assert(rc == 0);
+
+          ptracer.Dump(std::cout, &regs, &fpregs, &sigmask);
           ptracer.TerminateSubprocess();
           break;
         }
