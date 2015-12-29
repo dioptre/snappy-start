@@ -24,11 +24,8 @@ To create a snapshot:
 ./out/ptracer ./out/elf_loader PROG ARGS...
 ```
 
-To run the snapshot:
-
-```
-(TODO: currently in flux)
-```
+This creates a self-contained executable `replay.out` in the current
+directory. Run it to restore the snapshot.
 
 The program will be snapshotted when it first calls an unhandled
 syscall, such as `getpid()`.
@@ -37,7 +34,7 @@ Example:
 
 ```
 $ ./out/ptracer ./out/elf_loader /usr/bin/python tests/python_example.py
-$ (TODO: currently in flux)
+$ ./replay.out
 Hello world, from restored Python process
 ```
 
@@ -50,4 +47,5 @@ they can later be replayed.
 
 Mark Seaborn put together an initial working end-to-end implementation.
 
-Kenton is now extending it to support more system calls.
+Kenton enhanced the implementation to produce a self-contained binary
+and extended it with support for more syscalls.

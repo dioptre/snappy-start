@@ -15,9 +15,11 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <iostream>
+#include <fstream>
 #include <list>
 #include <map>
 #include <memory>
@@ -28,7 +30,72 @@
 // This is an example of using ptrace() to log syscalls called by a
 // child process.
 
+extern "C" {
+  // We embed a full copy of replay.i -- created by running the C
+  // preprocessor on replay.h -- so that we can output a full
+  // self-contained translation unit for our replay and compile
+  // it directly.
+  extern char _binary_out_replay_i_start[];
+  extern char _binary_out_replay_i_end[];
+
+  // We also embed a copy of the linker script.
+  extern char _binary_elf_loader_linker_script_x_start[];
+  extern char _binary_elf_loader_linker_script_x_end[];
+}
+
 namespace {
+
+// ===================================================================
+// helpers
+
+#define CHECK_ERRNO(code) ({ \
+  auto res = code; \
+  if (res < 0) { \
+    perror(#code); \
+    abort(); \
+  } \
+  res; \
+})
+
+void WriteAll(int fd, const void* data, size_t size) {
+  while (size > 0) {
+    size_t n = CHECK_ERRNO(write(fd, data, size));
+    size -= n;
+    data = reinterpret_cast<const char*>(data) + n;
+  }
+}
+
+void WriteEscaped(std::ostream& out, const std::string& data) {
+  for (char c: data) {
+    switch (c) {
+      case '\a': out << "\\a"; break;
+      case '\b': out << "\\b"; break;
+      case '\f': out << "\\f"; break;
+      case '\n': out << "\\n"; break;
+      case '\r': out << "\\r"; break;
+      case '\t': out << "\\t"; break;
+      case '\v': out << "\\v"; break;
+      case '\'': out << "\\\'"; break;
+      case '\"': out << "\\\""; break;
+      case '\\': out << "\\\\"; break;
+      default:
+        if (c < 0x20 || c >= 0x7f) {
+          out << "\\";
+          char old_fill = out.fill('0');
+          auto old_flags = out.setf(std::ios_base::oct, std::ios_base::basefield);
+          out.width(3);
+          out << static_cast<unsigned int>(static_cast<uint8_t>(c));
+          out.fill(old_fill);
+          out.setf(old_flags);
+        } else {
+          out.put(c);
+        }
+        break;
+    }
+  }
+}
+
+// ===================================================================
 
 class EpollInfo;
 
@@ -104,36 +171,6 @@ class FileInfo {
   virtual bool CanSignalfd() {return false;}
   virtual void DidSignalfd(const sigset_t* mask, int flags) {abort();}
 };
-
-void WriteEscaped(std::ostream& out, const std::string& data) {
-  for (char c: data) {
-    switch (c) {
-      case '\a': out << "\\a"; break;
-      case '\b': out << "\\b"; break;
-      case '\f': out << "\\f"; break;
-      case '\n': out << "\\n"; break;
-      case '\r': out << "\\r"; break;
-      case '\t': out << "\\t"; break;
-      case '\v': out << "\\v"; break;
-      case '\'': out << "\\\'"; break;
-      case '\"': out << "\\\""; break;
-      case '\\': out << "\\\\"; break;
-      default:
-        if (c < 0x20 || c >= 0x7f) {
-          out << "\\";
-          char old_fill = out.fill('0');
-          auto old_flags = out.setf(std::ios_base::oct, std::ios_base::basefield);
-          out.width(3);
-          out << static_cast<unsigned int>(static_cast<uint8_t>(c));
-          out.fill(old_fill);
-          out.setf(old_flags);
-        } else {
-          out.put(c);
-        }
-        break;
-    }
-  }
-}
 
 // Standard input.
 class StdinInfo final : public FileInfo {
@@ -650,9 +687,13 @@ class Ptracer {
     }
   }
 
-  void Dump(std::ostream& out, const struct user_regs_struct* regs,
-                               const struct user_fpregs_struct* fpregs,
-                               const sigset_t* sigmask) {
+  void Dump(std::ostream& out, int mapfile,
+            const struct user_regs_struct* regs,
+            const struct user_fpregs_struct* fpregs,
+            const sigset_t* sigmask) {
+    out.write(_binary_out_replay_i_start,
+              _binary_out_replay_i_end - _binary_out_replay_i_start);
+
     uintptr_t mapfile_size = 0;
     for (auto &map : mappings_) {
       if (map.filename.empty() || (map.max_prot & PROT_WRITE)) {
@@ -669,8 +710,7 @@ class Ptracer {
       }
     }
 
-    out << "#include \"replay.h\"\n"
-           "void replay() {\n"
+    out << "void replay() {\n"
            "  replay_init(" << pid_ << ", " << maxFd << ", " << mapfile_size << ");\n";
 
     // Determine the final FD numbers mapping to each file.
@@ -699,8 +739,6 @@ class Ptracer {
       }
     }
 
-    FILE *mapfile = fopen("out_pages", "w");
-    assert(mapfile);
     uintptr_t mapfile_offset = 0;
 
     for (auto &map : mappings_) {
@@ -712,8 +750,9 @@ class Ptracer {
 
         for (uintptr_t offset = 0; offset < map.size;
              offset += sizeof(uintptr_t)) {
+          // TODO: read a page at a time, or at least write a page at a time
           uintptr_t word = ReadWord(map.addr + offset);
-          fwrite(&word, sizeof(word), 1, mapfile);
+          write(mapfile, &word, sizeof(word));
         }
         mapfile_offset += map.size;
       } else {
@@ -743,8 +782,6 @@ class Ptracer {
     out <<                              "\", " << sizeof(*sigmask) << ");\n"
            "  replay_finish(&state);\n";
 
-    fclose(mapfile);
-
     out << "}\n";
   }
 
@@ -766,12 +803,10 @@ class Ptracer {
 int main(int argc, char **argv) {
   assert(argc >= 2);
 
-  int pid = fork();
-  assert(pid >= 0);
+  pid_t pid = CHECK_ERRNO(fork());
   if (pid == 0) {
     // Start tracing of the current process by the parent process.
-    int rc = ptrace(PTRACE_TRACEME);
-    assert(rc == 0);
+    CHECK_ERRNO(ptrace(PTRACE_TRACEME));
 
     // This will trigger a SIGTRAP signal, which the parent will catch.
     execv(argv[1], argv + 1);
@@ -790,12 +825,10 @@ int main(int argc, char **argv) {
   assert(WSTOPSIG(status) == SIGTRAP);
 
   // Enable kSysFlag.
-  int rc = ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD);
-  assert(rc == 0);
+  CHECK_ERRNO(ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD));
 
   // Allow the process to continue until the next syscall entry/exit.
-  rc = ptrace(PTRACE_SYSCALL, pid, 0, 0);
-  assert(rc == 0);
+  CHECK_ERRNO(ptrace(PTRACE_SYSCALL, pid, 0, 0));
 
   // Whether the next signal will indicate a syscall entry.  If false,
   // the next signal will indicate a syscall exit.
@@ -817,34 +850,30 @@ int main(int argc, char **argv) {
 
   for (;;) {
     int status;
-    int rc = waitpid(pid, &status, 0);
-    assert(rc == pid);
-
+    CHECK_ERRNO(waitpid(pid, &status, 0));
     assert(WIFSTOPPED(status));
 
     if (WSTOPSIG(status) == (SIGTRAP | kSysFlag)) {
       struct user_regs_struct regs;
-      rc = ptrace(PTRACE_GETREGS, pid, 0, &regs);
-      assert(rc == 0);
+      CHECK_ERRNO(ptrace(PTRACE_GETREGS, pid, 0, &regs));
       if (syscall_entry) {
         // Disable use of the brk() heap so that we don't have to save
         // and restore the brk() heap pointer and heap contents.
         if (regs.orig_rax == __NR_brk) {
           regs.orig_rax = -1;
-          rc = ptrace(PTRACE_SETREGS, pid, 0, &regs);
-          assert(rc == 0);
+          CHECK_ERRNO(ptrace(PTRACE_SETREGS, pid, 0, &regs));
         } else if (!ptracer.CanHandleSyscall(&regs)) {
           // Unrecognised syscall: trigger snapshotting.
 
-          std::cerr << "ending record due to syscall: " << regs.orig_rax << std::endl;
+          std::cerr << "record ended due to syscall: "
+              << (long)regs.orig_rax << std::endl;
 
           // Rewind instruction pointer to before the syscall instruction.
           regs.rip -= 2;
           regs.rax = regs.orig_rax;
 
           struct user_fpregs_struct fpregs;
-          rc = ptrace(PTRACE_GETFPREGS, pid, 0, &fpregs);
-          assert(rc == 0);
+          CHECK_ERRNO(ptrace(PTRACE_GETFPREGS, pid, 0, &fpregs));
 
           sigset_t sigmask;
           sigemptyset(&sigmask);
@@ -852,11 +881,99 @@ int main(int argc, char **argv) {
           // The documentation claim that the third argument should be sizeof(sigset_t), but
           // it appears that the kernel's idea of sigset_t is 8 bytes whereas userspace defines
           // it to be much larger.
-          rc = ptrace((enum __ptrace_request)0x420a, pid, 8, &sigmask);
-          assert(rc == 0);
+          CHECK_ERRNO(ptrace((enum __ptrace_request)0x420a, pid, 8, &sigmask));
 
-          ptracer.Dump(std::cout, &regs, &fpregs, &sigmask);
-          ptracer.TerminateSubprocess();
+          char code_file[] = "/tmp/replay.XXXXXX.i";
+          int code_fd = CHECK_ERRNO(mkstemps(code_file, 2));
+
+          char page_file[] = "/tmp/replay-pages.XXXXXX.i";
+          int page_fd = CHECK_ERRNO(mkstemps(page_file, 2));
+          CHECK_ERRNO(unlink(page_file));
+
+          {
+            std::ofstream out(code_file);
+            ptracer.Dump(out, page_fd, &regs, &fpregs, &sigmask);
+            ptracer.TerminateSubprocess();
+          }
+
+          std::string obj = code_file;
+          obj += ".o";
+
+          // Compile the code.
+          {
+            pid_t child = CHECK_ERRNO(fork());
+            if (child == 0) {
+              execlp("gcc", "gcc", "-O2", "-fno-stack-protector",
+                     "-c", code_file, "-o", obj.c_str(), (char*)nullptr);
+              perror("couldn't exec gcc");
+              abort();
+            }
+
+            int status;
+            CHECK_ERRNO(waitpid(child, &status, 0));
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+              fprintf(stderr, "compilation failed: %s\n", code_file);
+              abort();
+            }
+          }
+
+          // Link it.
+          {
+            int pipefds[2];
+            CHECK_ERRNO(pipe(pipefds));
+
+            pid_t child = CHECK_ERRNO(fork());
+            if (child == 0) {
+              CHECK_ERRNO(dup2(pipefds[0], 0));
+              CHECK_ERRNO(close(pipefds[0]));
+              CHECK_ERRNO(close(pipefds[1]));
+              execlp("ld.bfd", "ld.bfd", "-m", "elf_x86_64",
+                     "--build-id", "-static", "-z", "max-page-size=0x1000",
+                     "--defsym", "RESERVE_TOP=0", "--script", "/dev/stdin",
+                     obj.c_str(), "-o", "replay.out", (char*)nullptr);
+              perror("couldn't exec gcc");
+              abort();
+            }
+
+            close(pipefds[0]);
+            WriteAll(pipefds[1],
+                 _binary_elf_loader_linker_script_x_start,
+                 _binary_elf_loader_linker_script_x_end -
+                 _binary_elf_loader_linker_script_x_start);
+            close(pipefds[1]);
+
+            int status;
+            CHECK_ERRNO(waitpid(child, &status, 0));
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+              fprintf(stderr, "linking failed: %s\n", code_file);
+              abort();
+            }
+          }
+
+          CHECK_ERRNO(unlink(code_file));
+          CHECK_ERRNO(close(code_fd));
+
+          int execfd = CHECK_ERRNO(open("replay.out", O_WRONLY | O_APPEND));
+
+          // Round file size up to next page.
+          struct stat stats;
+          CHECK_ERRNO(fstat(execfd, &stats));
+          CHECK_ERRNO(ftruncate(execfd, RoundUpPageSize(stats.st_size)));
+
+          // Append page map.
+          CHECK_ERRNO(fstat(page_fd, &stats));
+          void* pages = mmap(nullptr, stats.st_size, PROT_READ, MAP_PRIVATE, page_fd, 0);
+          if (pages == MAP_FAILED) {
+            perror("mmap");
+            abort();
+          }
+          WriteAll(execfd, pages, stats.st_size);
+
+          // Close down.
+          CHECK_ERRNO(munmap(pages, stats.st_size));
+          CHECK_ERRNO(close(page_fd));
+          CHECK_ERRNO(close(execfd));
+
           break;
         }
       } else {
@@ -865,8 +982,7 @@ int main(int argc, char **argv) {
       syscall_entry = !syscall_entry;
 
       // Allow the process to continue until the next syscall entry/exit.
-      rc = ptrace(PTRACE_SYSCALL, pid, 0, 0);
-      assert(rc == 0);
+      CHECK_ERRNO(ptrace(PTRACE_SYSCALL, pid, 0, 0));
     }
   }
   return 0;

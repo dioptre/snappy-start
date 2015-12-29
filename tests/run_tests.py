@@ -16,23 +16,20 @@ def AssertEquals(x, y):
     raise AssertionError('%r != %r' % (x, y))
 
 
-def GetSnapshotSyscallNumber():
-  fh = open('out_info', 'r')
-  rax = struct.unpack('q', fh.read(8))[0]
-  return rax
-
-
 def RunTest(cmd, sysnum, use_elf_loader=True):
   if use_elf_loader:
     cmd = ['./out/elf_loader'] + cmd
   print '* Running test: %s' % ' '.join(cmd)
-  subprocess.check_call(['./out/ptracer'] + cmd)
+  output = subprocess.Popen(['./out/ptracer'] + cmd, stderr=subprocess.PIPE) \
+      .communicate()[1];
+
   # Check that the program was snapshotted at the expected syscall.
   # Otherwise, it could have been stopped earlier than we expected,
   # which would mean we wouldn't be testing the parts we expected to
   # test.
-  AssertEquals(GetSnapshotSyscallNumber(), sysnum)
-  subprocess.check_call(['./out/restore'])
+  AssertEquals("record ended due to syscall: %d\n" % sysnum, output)
+
+  subprocess.check_call(['./replay.out'])
 
 
 def Main():

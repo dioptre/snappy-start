@@ -126,7 +126,7 @@ typedef uintptr_t __attribute__((may_alias)) stack_val_t;
 static int progfd;
 static uintptr_t progmem;
 
-static void reply_main(stack_val_t* argp) {
+void replay_main(stack_val_t* argp) {
   ++argp;                // skip argc
   while (*argp++ != 0);  // skip argv
   while (*argp++ != 0);  // skip envp
@@ -250,7 +250,7 @@ asm(".pushsection \".text\",\"ax\",@progbits\n"
     "xorq %rbp, %rbp\n"
     "movq %rsp, %rdi\n"         /* Argument: stack block.  */
     "andq $-16, %rsp\n"         /* Align the stack as per ABI.  */
-    "call reply_main\n"
+    "call replay_main\n"
     ".popsection"
     );
 #else
