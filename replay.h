@@ -196,6 +196,13 @@ static void replay_write(int fd, const void *data, size_t size) {
   }
 }
 
+static void replay_open(int fd, const char* path, int flags, off_t seek) {
+    int fd2 = sys_open(path, flags, 0);
+    if (fd < 0 || fd2!=fd) {
+        sys_exit_group(1);
+    }
+}
+
 static void replay_close(int fd) {
   if (sys_close(fd) < 0) {
     sys_exit_group(1);

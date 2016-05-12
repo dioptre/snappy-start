@@ -279,7 +279,7 @@ public:
   void WriteReplay(int fd, std::ostream& out) override {
     out << "  replay_open(" << fd << ", \"";
     WriteEscaped(out, path);
-    out << "\", " << open_flags << ", 0, " << offset << ");\n";
+    out << "\", " << open_flags << ", " << offset << ");\n";
   }
 
   bool CanMmap() override {return true;}
