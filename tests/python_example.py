@@ -2,6 +2,8 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+from __future__ import print_function
+
 import errno
 import os
 
@@ -9,9 +11,9 @@ import os
 try:
     # This should fail because an empty pathname is invalid.
     os.mknod('')
-except OSError, exc:
+except OSError as exc:
     assert exc.errno == errno.ENOENT, exc.errno
 else:
     raise AssertionError('No exception raised')
 
-print 'Hello world, from restored Python process'
+print('Hello world, from restored Python process')

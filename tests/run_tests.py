@@ -1,6 +1,7 @@
 # Copyright 2015 Google Inc. All Rights Reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
+from __future__ import print_function
 
 import struct
 import subprocess
@@ -19,7 +20,7 @@ def AssertEquals(x, y):
 def RunTest(cmd, sysnum, use_elf_loader=True):
   if use_elf_loader:
     cmd = ['./out/elf_loader'] + cmd
-  print '* Running test: %s' % ' '.join(cmd)
+  print('* Running test: %s' % ' '.join(cmd))
   output = subprocess.Popen(['./out/ptracer'] + cmd, stderr=subprocess.PIPE) \
       .communicate()[1];
 
@@ -27,7 +28,7 @@ def RunTest(cmd, sysnum, use_elf_loader=True):
   # Otherwise, it could have been stopped earlier than we expected,
   # which would mean we wouldn't be testing the parts we expected to
   # test.
-  AssertEquals("record ended due to syscall: %d\n" % sysnum, output)
+  AssertEquals("record ended due to syscall: %d\n" % sysnum, output.decode())
 
   subprocess.check_call(['./replay.out'])
 
@@ -43,7 +44,7 @@ def Main():
   # Get list of sub-test names.
   proc = subprocess.Popen(['./out/save_restore_tests'], stdout=subprocess.PIPE)
   stdout = proc.communicate()[0]
-  test_names = stdout.strip().split('\n')
+  test_names = stdout.strip().decode().split('\n')
 
   sysnum_for_test = {
     'test_mknod_not_whitelisted': __NR_mknod,
